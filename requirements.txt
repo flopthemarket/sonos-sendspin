@@ -1,0 +1,5 @@
+aiohttp==3.10.11
+soco==0.30.4
+requests==2.32.3
+zeroconf==0.132.2
+paho-mqtt==1.6.1

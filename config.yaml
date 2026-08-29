@@ -1,0 +1,56 @@
+name: Sendspin Sonos Gateway
+version: "0.1.0"
+slug: sendspin_sonos_gateway
+description: Bridges a Sendspin audio stream to Sonos speakers with a live, glitch-free delay control.
+url: "https://github.com/yourname/sendspin-sonos-gateway"
+arch:
+  - aarch64
+  - amd64
+  - armv7
+  - armhf
+
+startup: services
+boot: auto
+init: false
+
+# Needed so SSDP discovery of Sonos ZonePlayers works, and so the
+# gateway's HTTP stream server is directly reachable by Sonos on the LAN.
+host_network: true
+
+# Needed to create/update HA entities (number, sensor, button, switch)
+# and to receive service calls via the Supervisor API.
+homeassistant_api: true
+hassio_api: true
+
+# Entities (number.sendspin_delay, sensors, button, switch) are published
+# via MQTT discovery, which is the standard way for a *supervisor add-on*
+# (as opposed to a custom integration) to create fully-fledged HA entities.
+services:
+  - "mqtt:want"
+
+ports:
+  8099/tcp: 8099
+ports_description:
+  8099/tcp: "Audio stream endpoint consumed by Sonos (play_uri)"
+
+options:
+  sonos_ip: ""
+  sendspin_host: ""
+  sendspin_port: 4400
+  player_name: "Living Room Sonos"
+  delay_ms: 1800
+  buffer_ms: 5000
+  stream_format: "flac"
+  log_level: "info"
+
+schema:
+  sonos_ip: str
+  sendspin_host: str
+  sendspin_port: int
+  player_name: str
+  delay_ms: int(0,5000)
+  buffer_ms: int(1000,20000)
+  stream_format: list(flac|mp3|wav)
+  log_level: list(debug|info|warning|error)
+
+image: "ghcr.io/yourname/sendspin-sonos-gateway-{arch}"
