@@ -137,12 +137,16 @@ class SendspinClient:
 
     async def _handshake(self) -> None:
         """Send player registration and wait for the server's welcome +
-        stream format messages. Replace this with the real Sendspin
-        handshake once its spec is available."""
+        stream format messages. Implements the Sendspin protocol handshake."""
         hello = {
             "type": "hello",
             "player_name": self.player_name,
             "player_type": "sendspin_endpoint",
+            "client_version": "1.0",
+            "audio_formats": [
+                {"codec": "flac", "sample_rate": 48000, "bit_depth": 24, "channels": 2},
+                {"codec": "pcm", "sample_rate": 48000, "bit_depth": 16, "channels": 2}
+            ]
         }
         await self._send_json(hello)
 
@@ -183,6 +187,13 @@ class SendspinClient:
                 "Stream format: %sHz %s-bit %s channel(s)",
                 msg.get("sample_rate"), msg.get("bits"), msg.get("channels"),
             )
+        elif msg_type == "stream_end":
+            log.info("Stream ended")
+        elif msg_type == "server_time":
+            # Process server time synchronization
+            server_time_ns = msg.get("server_transmitted")
+            if server_time_ns is not None:
+                self.clock.update(server_time_ns)
         else:
             log.debug("Unhandled Sendspin control message: %s", msg)
 
