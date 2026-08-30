@@ -1,49 +1,24 @@
 """
-Sendspin Client
+Sendspin Client using the official aiosendspin library.
 
-*** IMPORTANT / ASSUMPTIONS ***
-Your design doc specifies WHAT this component must do (register as a
-clock-synced, timestamped-PCM player) but not the literal wire format of
-the Sendspin protocol (handshake bytes, framing, message types, transport).
-I could not find a public specification for "Sendspin" to implement against,
-so this client is written as a clean, swappable module with:
-
-  1. A concrete, working TCP framing implementation (length-prefixed JSON
-     control messages + binary audio frames) that you can use as-is for a
-     first-party Sendspin coordinator, OR
-  2. Clear extension points (`_handshake`, `_handle_control_message`,
-     `_handle_audio_frame`) to drop in the real protocol once you share its
-     spec (e.g. is it based on RTP/RTSP, a custom TCP/UDP framing, mDNS
-     advertisement, WebSocket, etc).
-
-Everything downstream of "we received N bytes of 48kHz/16-bit/stereo PCM
-with an associated presentation timestamp" (ring buffer, delay engine,
-encoder, HTTP stream, Sonos) is fully implemented and protocol-agnostic.
-
-Assumed wire format (replace freely):
-    Control channel: TCP, newline-delimited JSON messages.
-      -> client sends: {"type": "hello", "player_name": ..., "player_type": "sendspin_endpoint"}
-      <- server sends: {"type": "welcome", "player_id": ..., "clock_ref_ns": ...}
-      <- server sends: {"type": "clock_sync", "server_time_ns": ...}
-      <- server sends: {"type": "stream_start", "sample_rate": 48000, "channels": 2, "bits": 16}
-    Audio channel: binary frames on the same TCP connection, each prefixed
-      by an 8-byte big-endian presentation timestamp (ns) and a 4-byte
-      big-endian payload length, followed by raw PCM payload bytes.
+This implementation replaces the TCP-based placeholder with a proper
+Sendspin protocol client that uses WebSockets with Noise encryption,
+as defined in the Sendspin specification.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import struct
-import time
+from typing import Callable, Optional
 
+from aiosendspin.client import SendspinClient as AiospinClient
+from aiosendspin.models.core import StreamStartMessage, StreamEndMessage, ServerTimePayload
+from aiosendspin.client import AudioFormat
 from ring_buffer import RingBuffer
 
 log = logging.getLogger("ssg.sendspin_client")
 
 RECONNECT_DELAY_S = 3
-TIMESTAMP_HEADER = struct.Struct(">Qi")  # (presentation_timestamp_ns, payload_len)
 
 
 class ClockSync:
@@ -56,38 +31,64 @@ class ClockSync:
         self.last_sync_monotonic: float = 0.0
 
     def update(self, server_time_ns: int) -> None:
-        local_ns = time.time_ns()
+        local_ns = asyncio.get_event_loop().time() * 1_000_000_000  # Convert to nanoseconds
         self.offset_ns = server_time_ns - local_ns
-        self.last_sync_monotonic = time.monotonic()
+        self.last_sync_monotonic = asyncio.get_event_loop().time()
 
     def to_local_ns(self, server_time_ns: int) -> int:
         return server_time_ns - self.offset_ns
 
 
 class SendspinClient:
-    def __init__(self, host: str, port: int, player_name: str, ring_buffer: RingBuffer):
+    """Sendspin client that uses the official aiosendspin library for
+    WebSocket connections with Noise encryption."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        player_name: str,
+        ring_buffer: RingBuffer,
+    ):
         self.host = host
         self.port = port
         self.player_name = player_name
         self.ring_buffer = ring_buffer
         self.clock = ClockSync()
 
-        self._reader: asyncio.StreamReader | None = None
-        self._writer: asyncio.StreamWriter | None = None
+        self._client: Optional[AiospinClient] = None
         self._connected = asyncio.Event()
         self._stop = asyncio.Event()
-        self.stream_info: dict = {}
+        self._stream_info: dict = {}
+        self._audio_format: Optional[AudioFormat] = None
 
     @property
     def connected(self) -> bool:
-        return self._connected.is_set()
+        # aiosendspin client has a connected property we can use
+        if self._client is not None:
+            return self._client.connected
+        return False
 
     async def wait_until_connected(self, timeout: float | None = None) -> bool:
+        # Wait until we're connected by polling the client's connected property
         try:
-            await asyncio.wait_for(self._connected.wait(), timeout=timeout)
+            # If we don't have a client yet, we can't be connected
+            if self._client is None:
+                return False
+
+            # Wait for the client to report connected
+            await asyncio.wait_for(
+                self._wait_for_client_connected(),
+                timeout=timeout
+            )
             return True
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, AttributeError):
             return False
+
+    async def _wait_for_client_connected(self) -> None:
+        """Wait for the underlying client to report connected."""
+        while self._client is not None and not self._client.connected:
+            await asyncio.sleep(0.1)
 
     async def run(self) -> None:
         """Long-running task: connect, register, stream audio, reconnect on
@@ -106,7 +107,6 @@ class SendspinClient:
             except Exception:
                 log.exception("Unexpected error in Sendspin client loop")
             finally:
-                self._connected.clear()
                 await self._close()
             if not self._stop.is_set():
                 await asyncio.sleep(RECONNECT_DELAY_S)
@@ -116,65 +116,127 @@ class SendspinClient:
         await self._close()
 
     async def _close(self) -> None:
-        if self._writer is not None:
+        if self._client is not None:
             try:
-                self._writer.close()
-                await self._writer.wait_closed()
+                await self._client.disconnect()
             except Exception:
                 pass
-        self._reader = None
-        self._writer = None
+        self._client = None
 
     async def _connect_and_stream(self) -> None:
         log.info("Connecting to Sendspin at %s:%s", self.host, self.port)
-        self._reader, self._writer = await asyncio.open_connection(self.host, self.port)
 
-        await self._handshake()
-        self._connected.set()
+        # Create the aiosendspin client
+        self._client = AiospinClient(
+            client_id="",  # Will be generated
+            client_name=self.player_name,
+            roles=["player"],  # We're a player role
+            device_info={},  # Could be enhanced with actual device info
+            player_support={},  # Could be enhanced
+            initial_volume=100,
+            initial_muted=False,
+        )
+
+        # Set up event handlers
+        self._client.add_audio_chunk_listener(self._on_audio_chunk)
+        self._client.add_stream_start_listener(self._on_stream_start)
+        self._client.add_stream_end_listener(self._on_stream_end)
+        self._client.add_server_command_listener(self._on_server_command)  # Handle all server commands
+        self._client.add_disconnect_listener(self._on_disconnected)
+        # Note: We'll handle connected state by checking the client's connected property
+
+        # Connect to the server
+        url = f"ws://{self.host}:{self.port}/sendspin"
+        await self._client.connect(url)
+
+        # Wait for connection to be established (we'll check in wait_until_connected)
         log.info("Registered with Sendspin as player '%s'", self.player_name)
 
-        await self._stream_loop()
+        # Keep the connection alive until stopped
+        await self._stop.wait()
 
-    async def _handshake(self) -> None:
-        """Send player registration and wait for the server's welcome +
-        stream format messages. Implements the Sendspin protocol handshake."""
-        hello = {
-            "type": "hello",
-            "player_name": self.player_name,
-            "player_type": "sendspin_endpoint",
-            "client_version": "1.0",
-            "audio_formats": [
-                {"codec": "flac", "sample_rate": 48000, "bit_depth": 24, "channels": 2},
-                {"codec": "pcm", "sample_rate": 48000, "bit_depth": 16, "channels": 2}
-            ]
-        }
-        await self._send_json(hello)
+    def _on_server_command(self, message) -> None:
+        """Handle server command messages from the server."""
+        # Handle server time synchronization
+        if hasattr(message, 'payload') and isinstance(message.payload, ServerTimePayload):
+            server_time_ns = message.payload.server_transmitted
+            log.debug("Received server time: %d ns", server_time_ns)
+            self.clock.update(server_time_ns)
+        # Other server commands can be handled here if needed
 
-        # Read control messages until we've seen "stream_start"
-        while True:
-            msg = await self._read_json_line()
-            if msg is None:
-                raise ConnectionError("Sendspin server closed connection during handshake")
-            await self._handle_control_message(msg)
-            if msg.get("type") == "stream_start":
-                self.stream_info = msg
-                break
+    def _on_stream_start(self, message: StreamStartMessage) -> None:
+        """Handle stream start messages from the server."""
+        log.info("Stream started: %s", message)
+        if hasattr(message, 'payload'):
+            payload = message.payload
+            # The payload should be a StreamStartPayload
+            if hasattr(payload, 'player') and payload.player:
+                self._audio_format = payload.player
+                log.info(
+                    "Audio format: %s %dHz %d-bit %dch",
+                    payload.player.codec.value if payload.player.codec else "unknown",
+                    payload.player.sample_rate,
+                    payload.player.bit_depth,
+                    payload.player.channels,
+                )
+            self._stream_info = {
+                "sample_rate": payload.player.sample_rate if payload.player else 48000,
+                "channels": payload.player.channels if payload.player else 2,
+                "bits": payload.player.bit_depth if payload.player else 16,
+            }
 
-    async def _stream_loop(self) -> None:
-        assert self._reader is not None
-        while not self._stop.is_set():
-            header = await self._reader.readexactly(TIMESTAMP_HEADER.size)
-            presentation_ts_ns, payload_len = TIMESTAMP_HEADER.unpack(header)
-            payload = await self._reader.readexactly(payload_len)
-            self._handle_audio_frame(presentation_ts_ns, payload)
+    def _on_stream_end(self, message: StreamEndMessage) -> None:
+        """Handle stream end messages from the server."""
+        log.info("Stream ended")
+        self._stream_info = {}
+        self._audio_format = None
+
+    def _on_audio_chunk(self, timestamp_ns: int, audio_data: bytes, fmt: AudioFormat) -> None:
+        """Handle incoming audio chunks from the server."""
+        # Convert timestamp from nanoseconds to local time using our clock sync
+        local_timestamp_ns = self.clock.to_local_ns(timestamp_ns)
+
+        # Write the PCM data to the ring buffer
+        self.ring_buffer.write(audio_data)
+
+        log.debug(
+            "Received audio chunk: %d bytes at timestamp %d ns (local: %d ns)",
+            len(audio_data),
+            timestamp_ns,
+            local_timestamp_ns,
+        )
+
+    def _on_connected(self) -> None:
+        """Called when the client successfully connects."""
+        log.info("Connected to Sendspin server")
+        self._connected.set()
+
+    def _on_disconnected(self) -> None:
+        """Called when the client disconnects."""
+        log.info("Disconnected from Sendspin server")
+        self._connected.clear()
+
+    # Properties to maintain compatibility with the original interface
+    @property
+    def stream_info(self) -> dict:
+        return self._stream_info
 
     def _handle_audio_frame(self, presentation_ts_ns: int, pcm_bytes: bytes) -> None:
-        """Feed decoded/raw PCM into the ring buffer. If your Sendspin
-        stream is compressed rather than raw PCM, decode it here before
-        writing to the buffer."""
+        """Compatibility method for the original interface.
+
+        Note: With aiosendspin, we receive audio chunks directly via the
+        audio_chunk callback, so this method is not used in the new implementation.
+        However, we keep it for compatibility with any existing code that might
+        call it directly.
+        """
         self.ring_buffer.write(pcm_bytes)
 
     async def _handle_control_message(self, msg: dict) -> None:
+        """Compatibility method for the original interface.
+
+        Note: With aiosendspin, control messages are handled via the event system,
+        so this method is not used in the new implementation.
+        """
         msg_type = msg.get("type")
         if msg_type == "welcome":
             log.info("Sendspin welcome: player_id=%s", msg.get("player_id"))
@@ -190,26 +252,8 @@ class SendspinClient:
         elif msg_type == "stream_end":
             log.info("Stream ended")
         elif msg_type == "server_time":
-            # Process server time synchronization
             server_time_ns = msg.get("server_transmitted")
             if server_time_ns is not None:
                 self.clock.update(server_time_ns)
         else:
             log.debug("Unhandled Sendspin control message: %s", msg)
-
-    async def _send_json(self, obj: dict) -> None:
-        assert self._writer is not None
-        data = (json.dumps(obj) + "\n").encode("utf-8")
-        self._writer.write(data)
-        await self._writer.drain()
-
-    async def _read_json_line(self) -> dict | None:
-        assert self._reader is not None
-        line = await self._reader.readline()
-        if not line:
-            return None
-        try:
-            return json.loads(line.decode("utf-8"))
-        except json.JSONDecodeError:
-            log.warning("Malformed control message: %r", line)
-            return {}
