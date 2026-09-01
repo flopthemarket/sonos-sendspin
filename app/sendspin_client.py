@@ -143,7 +143,7 @@ class SendspinClient:
         self._client.add_stream_end_listener(self._on_stream_end)
         self._client.add_server_command_listener(self._on_server_command)  # Handle all server commands
         self._client.add_disconnect_listener(self._on_disconnected)
-        # Note: We'll handle connected state by checking the client's connected property
+        self._client.add_connect_listener(self._on_connected)
 
         # Connect to the server
         url = f"ws://{self.host}:{self.port}/sendspin"
