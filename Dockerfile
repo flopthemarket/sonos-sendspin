@@ -1,22 +1,29 @@
-ARG BUILD_FROM
-FROM ${BUILD_FROM:-ghcr.io/home-assistant/amd64-base:3.19}
+# https://developers.home-assistant.io/docs/apps/configuration#app-dockerfile
+ARG BUILD_FROM=ghcr.io/home-assistant/base:3.23
+FROM ${BUILD_FROM}
 
-# ffmpeg provides the encoders (flac/mp3/wav) used by the audio pipeline
-RUN apk add --no-cache \
-        python3 \
-        py3-pip \
-        ffmpeg \
-        curl
+# Execute during the build of the image
+ARG TEMPIO_VERSION=2021.09.0
+ARG TARGETARCH
+RUN \
+    if [ -z "${TARGETARCH}" ]; then \
+        echo "TARGETARCH is not set, please use Docker BuildKit for the build." && exit 1; \
+    fi \
+    && case "${TARGETARCH}" in \
+        amd64) tempio_arch="amd64" ;; \
+        arm64) tempio_arch="aarch64" ;; \
+        *) echo "Unsupported TARGETARCH: ${TARGETARCH}" && exit 1 ;; \
+    esac \
+    && curl -sSLf -o /usr/bin/tempio \
+        "https://github.com/home-assistant/tempio/releases/download/${TEMPIO_VERSION}/tempio_${tempio_arch}"
 
-WORKDIR /app
+# Copy rootfs/"
 
-COPY requirements.txt /app/requirements.txt
-RUN pip3 install --no-cache-dir --break-system-packages -r /app/requirements.txt
+# Copy root filesystem
+COPY rootfs /
 
-COPY app/ /app/app/
-COPY run.sh /app/run.sh
-RUN chmod a+x /app/run.sh
-
-EXPOSE 8099
-
-ENTRYPOINT ["/app/run.sh"]
+LABEL \
+    org.opencontainers.image.title="Home Assistant App: Sendspin Sonos Gateway" \
+    org.opencontainers.image.description="Bridges a Sendspin audio stream to Sonos speakers with a live, glitch-free delay control." \
+    org.opencontainers.image.source="https://github.com/flopthemarket/sonos-sendspin" \
+    org.opencontainers.image.licenses="MIT"

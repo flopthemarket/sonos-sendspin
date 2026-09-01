@@ -1,0 +1,4 @@
+# https://developers.home-assistant.io/docs/apps/repository#repository-configuration
+name: Sendspin Sonos Gateway Repository
+url: 'https://github.com/flopthemarket/sonos-sendspin'
+maintainer: flopthemarket <flopthemarket@example.com>
