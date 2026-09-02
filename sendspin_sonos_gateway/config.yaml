@@ -53,4 +53,8 @@ schema:
   stream_format: list(flac|mp3|wav)
   log_level: list(debug|info|warning|error)
 
-image: "ghcr.io/yourname/sendspin-sonos-gateway-{arch}"
+# No `image:` field on purpose: without a real published registry image,
+# declaring one here just makes Supervisor try (and fail) to pull a
+# nonexistent tag. Omitting it tells Supervisor to build the image locally
+# from this directory's Dockerfile + build.yaml instead, which is what you
+# want for a local/community add-on that isn't publishing prebuilt images.

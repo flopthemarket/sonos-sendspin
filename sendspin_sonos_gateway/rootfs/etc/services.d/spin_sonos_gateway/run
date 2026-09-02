@@ -1,0 +1,18 @@
+#!/usr/bin/with-contenv bashio
+# ==============================================================================
+# Start the sendspin-sonos-gateway service
+# s6-overlay docs: https://github.com/just-containers/s6-overlay
+# ==============================================================================
+
+# Every module in app/ uses flat, non-package imports (e.g. `from config
+# import Config`, not `from .config import Config`), matching a script run
+# from inside the app/ directory itself. `python3 -m app.main` from /app
+# would NOT work here - it puts /app (not /app/app) on sys.path, so those
+# bare `from config import ...`-style imports fail with
+# "ModuleNotFoundError: No module named 'config'". Running the file
+# directly from within app/ is what actually matches how every module in
+# this codebase is written.
+cd /app/app || bashio::exit.nok "Could not find /app/app"
+
+bashio::log.info "Starting Sendspin Sonos Gateway..."
+exec python3 -u main.py
