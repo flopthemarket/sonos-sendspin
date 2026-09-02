@@ -36,7 +36,7 @@ ports_description:
 options:
   sonos_ip: ""
   sendspin_host: ""
-  sendspin_port: 4400
+  sendspin_port: 8927
   player_name: "Living Room Sonos"
   delay_ms: 1800
   buffer_ms: 5000

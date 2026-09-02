@@ -16,7 +16,7 @@ log = logging.getLogger("ssg.config")
 DEFAULTS = {
     "sonos_ip": "",
     "sendspin_host": "",
-    "sendspin_port": 4400,
+    "sendspin_port": 8927,
     "player_name": "Living Room Sonos",
     "delay_ms": 1800,
     "buffer_ms": 5000,
@@ -29,7 +29,7 @@ DEFAULTS = {
 class Config:
     sonos_ip: str = ""
     sendspin_host: str = ""
-    sendspin_port: int = 4400
+    sendspin_port: int = 8927
     player_name: str = "Living Room Sonos"
     delay_ms: int = 1800
     buffer_ms: int = 5000

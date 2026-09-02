@@ -22,6 +22,39 @@ API details it was checked against.
 | Sonos control (SoCo) | `app/sonos_controller.py` | ⚠️ not tested — no Sonos hardware available in dev. Logic follows SoCo's documented API (`discover`, `play_uri`, `group.coordinator`, `unjoin`, etc). |
 | HA entities via MQTT discovery | `app/ha_entities.py` | ⚠️ not tested — no MQTT broker/HA instance available in dev |
 
+## Connecting to Music Assistant's Sendspin provider
+
+Per Music Assistant's own Sendspin documentation:
+
+- The server listens at `ws://<music-assistant-ip>:8927/sendspin` by
+  default - this add-on's `sendspin_port` default is now `8927` to match
+  (an earlier version of this add-on defaulted to `4400`, which was never
+  a real Sendspin default, just an unverified placeholder - fixed now).
+- **This gateway connects unencrypted.** `aiosendspin==6.0.1`, which this
+  add-on is built and verified against, doesn't implement the protocol's
+  Noise encryption/pairing handshake at all. Music Assistant's docs
+  describe this as a "legacy client" and it will show up in the Sendspin
+  player's settings with security state **"connected without encryption."**
+  For it to connect at all, the Sendspin provider's **"Allow legacy
+  clients"** setting must be left on (it's on by default, but Music
+  Assistant's own docs note it's temporary and may be removed in a future
+  release - if a future MA release removes it, this gateway would need
+  `aiosendspin` bumped to a version with real Noise/pairing support and
+  `app/sendspin_client.py` updated accordingly; see the version-pin note
+  below).
+- Music Assistant already has its own **per-player "Static playback delay
+  (ms)"** setting (0-5000ms) built into the Sendspin protocol itself. This
+  is *not* what this add-on's `delay_ms` controls - that MA-side setting
+  is for genuine Sendspin clients doing their own local, sample-accurate
+  playback scheduling, which Sonos cannot do. This add-on's `delay_ms`
+  instead controls how far behind the *ring buffer's* read pointer trails
+  its write pointer before audio reaches Sonos over HTTP - a different
+  mechanism solving the same "keep this speaker in sync" problem, needed
+  specifically because Sonos isn't a native Sendspin endpoint.
+- Audio is sent to Sendspin players as 16-bit, matching what this add-on
+  already assumes (`SupportedAudioFormat(..., bit_depth=16)`) - no change
+  needed there.
+
 ## Repository structure (why the GitHub-URL error happened)
 
 Home Assistant's Supervisor expects each add-on to live in its **own
