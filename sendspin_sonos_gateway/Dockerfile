@@ -2,8 +2,10 @@
 #
 # BUILD_FROM is supplied automatically by the Supervisor build system per
 # architecture, using the mapping in build.yaml - no manual TARGETARCH
-# branching needed here.
-ARG BUILD_FROM
+# branching needed here. The dummy default below just silences buildkit's
+# "InvalidDefaultArgInFrom" lint warning for standalone `docker build` runs
+# without --build-arg BUILD_FROM=...; Supervisor always overrides it.
+ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.20
 FROM ${BUILD_FROM}
 
 # ffmpeg provides the encoders (flac/mp3/wav) used by the audio pipeline.
