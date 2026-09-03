@@ -31,6 +31,7 @@ class StreamServer:
         self._app.router.add_get("/healthz", self._handle_health)
         self._runner: web.AppRunner | None = None
         self.active_listeners = 0
+        self._current_task: asyncio.Task | None = None
 
     @property
     def stream_path(self) -> str:
@@ -58,6 +59,28 @@ class StreamServer:
         })
 
     async def _handle_stream(self, request: web.Request) -> web.StreamResponse:
+        # RingBuffer now gives every connection its own independent reader
+        # cursor (see ring_buffer.py), so concurrent connections are safe
+        # and no longer corrupt each other's audio. But Sonos only ever
+        # needs ONE active connection to its coordinator's stream URI - a
+        # second one showing up almost always means Sonos is retrying
+        # because the first one appeared stuck or silent, not that it
+        # genuinely wants two simultaneous streams. So we still close out
+        # any previous connection when a new one arrives: it avoids piling
+        # up ffmpeg processes forever, and gives Sonos a single, immediately
+        # fresh connection to work with instead of leaving it split across
+        # two half-alive ones.
+        previous_task = self._current_task
+        current_task = asyncio.current_task()
+        self._current_task = current_task
+        if previous_task is not None and not previous_task.done():
+            log.info(
+                "New stream connection from %s while a previous one was still "
+                "open; closing the previous one (likely a Sonos retry/reconnect)",
+                request.remote,
+            )
+            previous_task.cancel()
+
         log.info("Stream connection opened from %s", request.remote)
         response = web.StreamResponse(
             status=200,
@@ -80,8 +103,14 @@ class StreamServer:
                         await response.write(chunk)
                     except (ConnectionResetError, asyncio.CancelledError):
                         break
+        except asyncio.CancelledError:
+            # We were the previous connection and just got superseded by a
+            # newer one above - that's expected, not an error.
+            pass
         finally:
             self.active_listeners -= 1
+            if self._current_task is current_task:
+                self._current_task = None
             log.info("Stream connection closed from %s", request.remote)
 
         return response

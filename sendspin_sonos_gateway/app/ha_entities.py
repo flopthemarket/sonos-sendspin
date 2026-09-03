@@ -73,10 +73,12 @@ def _get_mqtt_service_info(supervisor_token: str) -> dict:
 
 class HAEntities:
     def __init__(self, supervisor_token: str, on_delay_command=None,
-                 on_reconnect_command=None, on_bridge_enabled_command=None):
+                 on_reconnect_command=None, on_bridge_enabled_command=None,
+                 on_volume_command=None):
         self._on_delay_command = on_delay_command
         self._on_reconnect_command = on_reconnect_command
         self._on_bridge_enabled_command = on_bridge_enabled_command
+        self._on_volume_command = on_volume_command
 
         broker = _get_mqtt_service_info(supervisor_token)
         self._client = mqtt.Client(client_id=NODE_ID)
@@ -109,6 +111,7 @@ class HAEntities:
         log.info("MQTT connected; publishing discovery configs")
         self._publish_discovery()
         client.subscribe(f"{NODE_ID}/number/delay/set")
+        client.subscribe(f"{NODE_ID}/number/volume/set")
         client.subscribe(f"{NODE_ID}/button/reconnect/press")
         client.subscribe(f"{NODE_ID}/switch/bridge_enabled/set")
 
@@ -118,6 +121,8 @@ class HAEntities:
         try:
             if topic.endswith("number/delay/set") and self._on_delay_command:
                 self._on_delay_command(int(float(payload)))
+            elif topic.endswith("number/volume/set") and self._on_volume_command:
+                self._on_volume_command(int(float(payload)))
             elif topic.endswith("button/reconnect/press") and self._on_reconnect_command:
                 self._on_reconnect_command()
             elif topic.endswith("switch/bridge_enabled/set") and self._on_bridge_enabled_command:
@@ -137,6 +142,16 @@ class HAEntities:
                 "state_topic": f"{base}/number/delay/state",
                 "min": 0, "max": 5000, "step": 10,
                 "unit_of_measurement": "ms",
+                "mode": "slider",
+                "device": DEVICE_INFO,
+            }),
+            ("number", "volume", {
+                "name": "Sendspin Sonos Volume",
+                "unique_id": f"{NODE_ID}_volume",
+                "command_topic": f"{base}/number/volume/set",
+                "state_topic": f"{base}/number/volume/state",
+                "min": 0, "max": 100, "step": 1,
+                "unit_of_measurement": "%",
                 "mode": "slider",
                 "device": DEVICE_INFO,
             }),
@@ -183,6 +198,9 @@ class HAEntities:
     # -------------------------------------------------------- updating --
     def publish_delay(self, delay_ms: int) -> None:
         self._client.publish(f"{NODE_ID}/number/delay/state", str(delay_ms), retain=True)
+
+    def publish_volume(self, volume: int) -> None:
+        self._client.publish(f"{NODE_ID}/number/volume/state", str(volume), retain=True)
 
     def publish_latency_snapshot(self, snapshot: dict) -> None:
         self._client.publish(

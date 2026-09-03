@@ -77,6 +77,7 @@ class Gateway:
             on_delay_command=self._on_delay_command,
             on_reconnect_command=self._on_reconnect_command,
             on_bridge_enabled_command=self._on_bridge_enabled_command,
+            on_volume_command=self._on_volume_command,
         )
 
         self._gateway_host = _local_ip_guess()
@@ -97,6 +98,17 @@ class Gateway:
         self.ha.publish_bridge_enabled(enabled)
         log.info("Bridge %s via HA switch", "enabled" if enabled else "disabled")
 
+    def _on_volume_command(self, volume: int) -> None:
+        volume = max(0, min(100, volume))
+        log.info("Setting Sonos volume to %d via HA", volume)
+        if self._loop is not None:
+            asyncio.run_coroutine_threadsafe(self._set_sonos_volume(volume), self._loop)
+
+    async def _set_sonos_volume(self, volume: int) -> None:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self.sonos.set_volume, volume)
+        self.ha.publish_volume(volume)
+
     async def _reconnect_sonos(self) -> None:
         loop = asyncio.get_event_loop()
         ok = await loop.run_in_executor(None, self.sonos.discover_and_bind)
@@ -108,6 +120,7 @@ class Gateway:
         self._loop = asyncio.get_event_loop()
         self.ha.start()
         self.ha.publish_delay(self.delay_engine.get_delay())
+        self.ha.publish_volume(100)
         self.ha.publish_bridge_enabled(self.bridge_enabled)
         self.ha.publish_stream_state("starting")
 

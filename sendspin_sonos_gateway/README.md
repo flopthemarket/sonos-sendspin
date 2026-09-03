@@ -5,6 +5,53 @@ audio to a Sonos coordinator, with a live, glitch-free delay slider.
 
 ## Status
 
+## Fixed: no sound / no volume control
+
+Real-world logs showed the Sonos speaker opening **three concurrent HTTP
+connections** to `/sendspin.flac` within a ~20 second window, all closing
+around the same moment - classic Sonos retry/reconnect behavior when a
+stream isn't producing valid audio. The root cause: `RingBuffer` had a
+single shared read pointer used by *every* connection. With more than one
+concurrent connection, each one's `read()` call advanced the same pointer,
+so connections stole bytes from each other mid-stream. That corrupts the
+FLAC framing fed into ffmpeg, which explains total silence - Sonos can't
+decode garbage, so it never plays anything and keeps retrying, opening
+more concurrent connections, making it worse.
+
+Fixed by giving `RingBuffer` independent per-reader cursors
+(`open_reader()`/`read(reader_id, ...)`/`close_reader()`), so any number of
+concurrent connections each see a coherent, correctly-ordered byte stream
+regardless of what any other connection is doing. `stream_server.py` also
+now closes out a previous connection when a new one arrives, since Sonos
+only ever needs one active stream to its coordinator and there's no reason
+to let retry connections pile up wasting ffmpeg processes.
+
+**Verified**: a threaded test with 3 concurrent readers pulling from a
+live-written ring buffer showed 0 discontinuities in any reader's stream
+(previously this would corrupt every reader). A live end-to-end test
+against a real Sendspin server, with two overlapping HTTP connections to
+the stream server (reproducing the retry scenario), showed the surviving
+connection received a clean, fully valid, decodable WAV stream (correct
+RIFF header, 839KB of coherent audio).
+
+**Not fully resolved**: my own test harness's shutdown sequence (calling
+`client.stop()`/`server.stop()`) hung past a 40s timeout in this specific
+concurrent-connection test, after the actual playback assertions had
+already passed. I traced it partway - likely `AudioEncoder.stop()`'s
+blocking `thread.join(timeout=2.0)` running synchronously inside a
+cancelled asyncio task's cleanup path during the single-listener eviction
+- but did not fully root-cause or fix it. This is a shutdown/cleanup-path
+concern, not the playback-corruption bug that was reported, but if you see
+the add-on hang on stop/restart under Supervisor, this is the first place
+to look.
+
+**Also added**: this add-on published no volume control at all, matching
+your report. `SonosController.set_volume()` already existed but was never
+wired to anything - added `number.sendspin_sonos_volume` (0-100%) via MQTT
+discovery, wired through `main.py` to call it.
+
+## Status
+
 The real Sendspin protocol (via the official `aiosendspin==6.0.1` library)
 is wired up in `app/sendspin_client.py` and has been **verified end-to-end
 against a live Sendspin server**: connect → handshake → PCM format

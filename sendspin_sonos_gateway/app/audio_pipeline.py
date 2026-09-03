@@ -5,10 +5,12 @@ Wraps an ffmpeg subprocess that converts the raw PCM coming out of the
 RingBuffer (already delay-adjusted by DelayEngine) into a container/codec
 Sonos can consume over HTTP (FLAC, MP3, or WAV).
 
-One AudioEncoder is spun up per active HTTP connection (see stream_server.py)
-since ffmpeg's stdin is fed by a background thread reading from the shared
-RingBuffer - multiple listeners simply get independent ffmpeg processes all
-reading from the same buffer at (roughly) the same read pointer.
+One AudioEncoder is spun up per active HTTP connection (see
+stream_server.py). Each encoder opens its own independent RingBuffer
+reader (see ring_buffer.py) so concurrent connections - which Sonos does
+open in practice around retries/reconnects - each get a coherent,
+correctly-ordered byte stream instead of stealing bytes from a pointer
+shared with other connections.
 """
 from __future__ import annotations
 
@@ -38,8 +40,9 @@ CONTENT_TYPES = {
 
 
 class AudioEncoder:
-    """Runs `ffmpeg` to transcode raw PCM (read live from the ring buffer)
-    into a streamable format. Use as an async context manager."""
+    """Runs `ffmpeg` to transcode raw PCM (read live from the ring buffer,
+    via this encoder's own independent reader cursor) into a streamable
+    format. Use as an async context manager."""
 
     def __init__(self, ring_buffer: RingBuffer, fmt: str = "flac"):
         if fmt not in FORMAT_ARGS:
@@ -50,8 +53,11 @@ class AudioEncoder:
         self._proc: subprocess.Popen | None = None
         self._feeder_thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._reader_id: int | None = None
 
     def start(self) -> None:
+        self._reader_id = self.ring_buffer.open_reader()
+
         cmd = [
             "ffmpeg",
             "-hide_banner", "-loglevel", "warning",
@@ -71,13 +77,14 @@ class AudioEncoder:
         )
         self._feeder_thread = threading.Thread(target=self._feed_loop, daemon=True)
         self._feeder_thread.start()
-        log.debug("Started ffmpeg encoder (%s)", self.fmt)
+        log.debug("Started ffmpeg encoder (%s) with reader #%d", self.fmt, self._reader_id)
 
     def _feed_loop(self) -> None:
         assert self._proc is not None and self._proc.stdin is not None
+        assert self._reader_id is not None
         try:
             while not self._stop.is_set():
-                chunk = self.ring_buffer.read(READ_CHUNK_BYTES, timeout=1.0)
+                chunk = self.ring_buffer.read(self._reader_id, READ_CHUNK_BYTES, timeout=1.0)
                 if self._stop.is_set():
                     break
                 if not chunk:
@@ -107,6 +114,9 @@ class AudioEncoder:
                 pass
         if self._feeder_thread is not None:
             self._feeder_thread.join(timeout=2.0)
+        if self._reader_id is not None:
+            self.ring_buffer.close_reader(self._reader_id)
+            self._reader_id = None
 
     async def __aenter__(self) -> "AudioEncoder":
         self.start()
