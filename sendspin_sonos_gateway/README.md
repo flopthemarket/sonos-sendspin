@@ -3,6 +3,46 @@
 Home Assistant add-on that acts as a virtual Sendspin player and forwards
 audio to a Sonos coordinator, with a live, glitch-free delay slider.
 
+## Fixed: real cause of "no sound" from live device logs
+
+A later round of real logs from an actual Sonos speaker + Music Assistant
+pinned down the actual culprit: Sonos opened its HTTP connection to
+`/sendspin.flac` immediately after this add-on called `play_uri`. But
+Music Assistant didn't actually start sending real PCM audio over Sendspin
+until **35 seconds later**. Sonos received total silence for those 35
+seconds, gave up, and closed the connection one second after real audio
+finally started flowing. Race lost by about a second.
+
+**Root cause**: this add-on called `sonos.play_stream()` (which tells
+Sonos to `play_uri` our HTTP stream) the instant the Sendspin *handshake*
+completed - not once actual audio was flowing. There can be an arbitrary
+gap between "player registered with the Sendspin server" and "Music
+Assistant actually starts streaming audio to it" (e.g. nothing was queued
+to play yet), and Sonos's own HTTP client won't tolerate a stream URI that
+stays silent very long after being told to play it.
+
+**Fix**: `sendspin_client.py` now distinguishes "handshake connected" from
+"audio actually started" (`wait_until_streaming()`, set the moment the
+first real PCM chunk arrives - not on the `stream_start` control message,
+which can itself arrive before real audio does). `main.py`'s Sonos
+bootstrap now binds to the Sonos speaker immediately (harmless, no audio
+needed for that step) but waits for `wait_until_streaming()` before ever
+calling `play_uri`. That way Sonos never opens a connection to a silent
+stream in the first place.
+
+Also fixed along the way: Sonos sends a `HEAD` request to validate the URL
+before its real `GET` (visible in the logs). That was hitting the same
+full streaming handler as `GET`, spinning up a needless ffmpeg process and
+potentially contending for the single-active-listener slot. `HEAD` now
+gets its own instant, lightweight response with no ffmpeg/ring-buffer
+involvement at all.
+
+**Verified live** against a real Sendspin test server: confirmed
+`wait_until_streaming()` correctly returns `False` immediately after
+handshake (before real audio exists) and only flips `True` once genuine
+PCM chunks arrive; confirmed a `HEAD` request now returns in single-digit
+milliseconds and opens zero ring-buffer readers.
+
 ## Status
 
 ## Fixed: no sound / no volume control

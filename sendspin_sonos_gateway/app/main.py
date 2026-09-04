@@ -154,6 +154,20 @@ class Gateway:
         if not ok:
             self.ha.publish_stream_state(f"error: {self.sonos.last_error}")
             return
+        self.ha.publish_stream_state("bound, waiting for audio")
+
+        # IMPORTANT: don't call play_uri until real PCM audio is actually
+        # flowing, not just once the Sendspin handshake completes. There
+        # can be a long, arbitrary gap between "player registered" and
+        # "Music Assistant actually starts sending audio" (e.g. nothing is
+        # playing yet), and Sonos's own HTTP client gives up on a stream
+        # URI that stays silent too long after being told to play it -
+        # calling play_uri too early causes Sonos to open the connection,
+        # receive dead air, time out and disconnect right as real audio
+        # finally arrives. Waiting here means Sonos never sees a silent
+        # connection in the first place.
+        log.info("Sonos bound; waiting for real Sendspin audio before calling play_uri...")
+        await self.sendspin_client.wait_until_streaming(timeout=None)
 
         ok = await loop.run_in_executor(None, self.sonos.play_stream, self._gateway_host)
         self.ha.publish_stream_state("streaming" if ok else f"error: {self.sonos.last_error}")

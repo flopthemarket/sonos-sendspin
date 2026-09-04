@@ -27,7 +27,13 @@ class StreamServer:
         self.stream_format = stream_format
         self.port = port
         self._app = web.Application()
-        self._app.router.add_get(f"/sendspin.{stream_format}", self._handle_stream)
+        # allow_head=False: aiohttp's add_get() auto-registers a HEAD route
+        # pointing at the SAME handler by default, which would spin up a
+        # full ffmpeg pipeline (and contend for the single-listener slot
+        # below) just to answer Sonos's routine "is this URL valid" HEAD
+        # probe. Route HEAD to its own lightweight handler instead.
+        self._app.router.add_get(f"/sendspin.{stream_format}", self._handle_stream, allow_head=False)
+        self._app.router.add_head(f"/sendspin.{stream_format}", self._handle_head)
         self._app.router.add_get("/healthz", self._handle_health)
         self._runner: web.AppRunner | None = None
         self.active_listeners = 0
@@ -57,6 +63,19 @@ class StreamServer:
             "buffer_fill_seconds": round(self.ring_buffer.fill_seconds(), 2),
             "active_listeners": self.active_listeners,
         })
+
+    async def _handle_head(self, request: web.Request) -> web.Response:
+        """Answer HEAD probes (Sonos sends one before GET-ing the actual
+        stream) instantly with just headers - no ffmpeg, no ring buffer
+        reader, no participation in single-listener eviction."""
+        log.debug("HEAD probe from %s", request.remote)
+        return web.Response(
+            status=200,
+            headers={
+                "Content-Type": CONTENT_TYPE_FOR.get(self.stream_format, "application/octet-stream"),
+                "Cache-Control": "no-cache, no-store",
+            },
+        )
 
     async def _handle_stream(self, request: web.Request) -> web.StreamResponse:
         # RingBuffer now gives every connection its own independent reader

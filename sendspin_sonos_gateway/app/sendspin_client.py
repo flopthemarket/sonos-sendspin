@@ -61,6 +61,7 @@ class SendspinClient:
 
         self._client: Optional[_AioSendspinClient] = None
         self._connected = asyncio.Event()
+        self._audio_started = asyncio.Event()
         self._stop = asyncio.Event()
         self._stream_info: dict = {}
 
@@ -71,6 +72,21 @@ class SendspinClient:
     async def wait_until_connected(self, timeout: float | None = None) -> bool:
         try:
             await asyncio.wait_for(self._connected.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def wait_until_streaming(self, timeout: float | None = None) -> bool:
+        """Wait until real PCM audio has actually started arriving from the
+        Sendspin server - NOT just until the handshake completed. There can
+        be an arbitrary delay between "player registered" and "Music
+        Assistant actually starts sending audio" (e.g. nothing is playing
+        yet), and Sonos's own HTTP client gives up on a stream URI that
+        stays silent too long after being told to play it. Callers should
+        wait for this before pointing Sonos at the stream, not just for
+        wait_until_connected()."""
+        try:
+            await asyncio.wait_for(self._audio_started.wait(), timeout=timeout)
             return True
         except asyncio.TimeoutError:
             return False
@@ -161,6 +177,8 @@ class SendspinClient:
             log.warning("Received unexpected codec %s from Sendspin server; dropping chunk", fmt.codec)
             return
         self.ring_buffer.write(audio_data)
+        if not self._audio_started.is_set():
+            self._audio_started.set()
 
     def _on_stream_start(self, message: StreamStartMessage) -> None:
         payload = getattr(message, "payload", None)
@@ -190,6 +208,7 @@ class SendspinClient:
     def _on_disconnected(self) -> None:
         log.info("Disconnected from Sendspin server")
         self._connected.clear()
+        self._audio_started.clear()
 
     @property
     def stream_info(self) -> dict:
