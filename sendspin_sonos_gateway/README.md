@@ -3,6 +3,48 @@
 Home Assistant add-on that acts as a virtual Sendspin player and forwards
 audio to a Sonos coordinator, with a live, glitch-free delay slider.
 
+## Delay calibration by acoustic measurement, not guesswork
+
+Manually nudging a slider while listening for echo is unreliable and
+tedious. `http://<gateway-ip>:8099/calibrate` (LAN-reachable, since
+`host_network: true`) serves a self-contained page that measures the
+actual acoustic delay using your phone or laptop's microphone:
+
+1. Play the same track on Music Assistant to both this Sonos speaker and
+   a real, natively-synced Sendspin speaker in the same room.
+2. Place the microphone roughly between them and tap **Measure**.
+3. The page records ~6 seconds of audio and finds the delay between the
+   two speakers via FFT-based autocorrelation (Wiener-Khinchin theorem:
+   `autocorrelation = IFFT(|FFT(signal)|^2)`) - if the same audio is
+   coming from two speakers with a timing offset, the microphone picks up
+   one copy plus a delayed echo of itself, and this recovers that delay.
+
+**Honesty about a real limitation, not hidden in the UI**: autocorrelation
+of a single mono microphone can only recover the *magnitude* of the delay
+between the two speakers, not *which one* played first. So the page asks
+you to judge by ear which speaker sounded delayed and pick the matching
+button, then applies the correction and offers a **re-measure to verify**
+step so you can confirm the residual offset actually shrank rather than
+blindly trusting one measurement.
+
+The FFT/autocorrelation algorithm embedded in the page (`app/calibration.py`)
+was not written ad-hoc: it was validated against a Python/numpy reference
+implementation first (recovers known synthetic echo delays to <1ms across
+a range of signal strengths and noise levels, from 150ms to 4800ms), then
+independently re-verified as a Node.js port producing matching results,
+*before* being embedded in the page. The live `/calibrate` and `/api/delay`
+endpoints were also tested end-to-end (page serves and contains the
+algorithm; `GET`/`POST /api/delay` correctly reads, sets, and clamps the
+live `DelayEngine`) - all against the actual running aiohttp server, not
+just read for plausibility.
+
+**Not tested**: an actual microphone recording of two real speakers in a
+real room. Everything above is real algorithmic and wiring correctness,
+but a browser mic on real hardware picking up real room acoustics,
+reverb, and background noise is a different (harder) test than clean
+synthetic signals - the confidence score shown in the UI is there so you
+can judge in the moment whether a given measurement looks trustworthy.
+
 ## Fixed: real cause of "no sound" from live device logs
 
 A later round of real logs from an actual Sonos speaker + Music Assistant

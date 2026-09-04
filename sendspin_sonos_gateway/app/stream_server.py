@@ -17,15 +17,22 @@ from aiohttp import web
 
 from audio_pipeline import AudioEncoder
 from ring_buffer import RingBuffer
+from calibration import render_page
 
 log = logging.getLogger("ssg.stream_server")
 
 
 class StreamServer:
-    def __init__(self, ring_buffer: RingBuffer, stream_format: str = "flac", port: int = 8099):
+    def __init__(self, ring_buffer: RingBuffer, stream_format: str = "flac", port: int = 8099,
+                 get_delay=None, set_delay=None):
         self.ring_buffer = ring_buffer
         self.stream_format = stream_format
         self.port = port
+        # Callbacks into DelayEngine, wired from main.py, so the web-based
+        # calibration page (/calibrate, /api/delay) can read/adjust the
+        # live delay the same way the HA number entity does.
+        self._get_delay = get_delay
+        self._set_delay = set_delay
         self._app = web.Application()
         # allow_head=False: aiohttp's add_get() auto-registers a HEAD route
         # pointing at the SAME handler by default, which would spin up a
@@ -35,6 +42,9 @@ class StreamServer:
         self._app.router.add_get(f"/sendspin.{stream_format}", self._handle_stream, allow_head=False)
         self._app.router.add_head(f"/sendspin.{stream_format}", self._handle_head)
         self._app.router.add_get("/healthz", self._handle_health)
+        self._app.router.add_get("/calibrate", self._handle_calibrate_page)
+        self._app.router.add_get("/api/delay", self._handle_get_delay)
+        self._app.router.add_post("/api/delay", self._handle_set_delay)
         self._runner: web.AppRunner | None = None
         self.active_listeners = 0
         self._current_task: asyncio.Task | None = None
@@ -76,6 +86,26 @@ class StreamServer:
                 "Cache-Control": "no-cache, no-store",
             },
         )
+
+    async def _handle_calibrate_page(self, request: web.Request) -> web.Response:
+        return web.Response(text=render_page(), content_type="text/html")
+
+    async def _handle_get_delay(self, request: web.Request) -> web.Response:
+        delay_ms = self._get_delay() if self._get_delay else 0
+        return web.json_response({"delay_ms": delay_ms})
+
+    async def _handle_set_delay(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+            delay_ms = int(body["delay_ms"])
+        except (ValueError, KeyError, TypeError):
+            return web.json_response({"error": "expected JSON body {\"delay_ms\": <int>}"}, status=400)
+
+        if self._set_delay is None:
+            return web.json_response({"error": "delay control not wired up"}, status=503)
+
+        applied = self._set_delay(delay_ms)
+        return web.json_response({"delay_ms": applied})
 
     async def _handle_stream(self, request: web.Request) -> web.StreamResponse:
         # RingBuffer now gives every connection its own independent reader

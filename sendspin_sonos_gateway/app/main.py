@@ -60,6 +60,8 @@ class Gateway:
         self.delay_engine = DelayEngine(self.ring_buffer, initial_delay_ms=cfg.delay_ms)
         self.stream_server = StreamServer(
             self.ring_buffer, stream_format=cfg.stream_format, port=cfg.stream_port,
+            get_delay=self.delay_engine.get_delay,
+            set_delay=self._on_delay_command,  # also publishes to HA, see below
         )
         self.sendspin_client = SendspinClient(
             host=cfg.sendspin_host,
@@ -84,9 +86,10 @@ class Gateway:
         self._loop: asyncio.AbstractEventLoop | None = None
 
     # -------------------------------------------------------- HA callbacks --
-    def _on_delay_command(self, delay_ms: int) -> None:
+    def _on_delay_command(self, delay_ms: int) -> int:
         applied = self.delay_engine.set_delay(delay_ms)
         self.ha.publish_delay(applied)
+        return applied
 
     def _on_reconnect_command(self) -> None:
         log.info("Manual reconnect requested via HA")
