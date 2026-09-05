@@ -18,6 +18,7 @@ from aiohttp import web
 from audio_pipeline import AudioEncoder
 from ring_buffer import RingBuffer
 from calibration import render_page
+from calibration_tone import get_wav_bytes as get_calibration_tone_bytes
 
 log = logging.getLogger("ssg.stream_server")
 
@@ -43,6 +44,7 @@ class StreamServer:
         self._app.router.add_head(f"/sendspin.{stream_format}", self._handle_head)
         self._app.router.add_get("/healthz", self._handle_health)
         self._app.router.add_get("/calibrate", self._handle_calibrate_page)
+        self._app.router.add_get("/calibration-tone.wav", self._handle_calibration_tone)
         self._app.router.add_get("/api/delay", self._handle_get_delay)
         self._app.router.add_post("/api/delay", self._handle_set_delay)
         self._runner: web.AppRunner | None = None
@@ -89,6 +91,9 @@ class StreamServer:
 
     async def _handle_calibrate_page(self, request: web.Request) -> web.Response:
         return web.Response(text=render_page(), content_type="text/html")
+
+    async def _handle_calibration_tone(self, request: web.Request) -> web.Response:
+        return web.Response(body=get_calibration_tone_bytes(), content_type="audio/wav")
 
     async def _handle_get_delay(self, request: web.Request) -> web.Response:
         delay_ms = self._get_delay() if self._get_delay else 0

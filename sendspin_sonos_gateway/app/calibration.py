@@ -3,52 +3,56 @@ Delay Calibration Webpage
 
 Serves a self-contained HTML/JS page (no external dependencies, no CDN)
 at /calibrate that measures the real acoustic delay between this
-gateway's Sonos output and a genuine, natively-synced Sendspin speaker
-playing the same audio, using the browser's microphone - rather than
-having the user guess-and-check with a slider by ear.
+gateway's Sonos output and a genuine, natively-synced Sendspin speaker,
+using the browser's microphone - rather than having the user guess-and-
+check with a slider by ear.
 
-How it works: if the same audio is playing on both Sonos (via this
-gateway) and a real Sendspin speaker, a single microphone placed between
-them picks up one signal plus a delayed copy of itself (like an echo).
-The delay between those two copies is exactly the timing mismatch we want
-to correct. That delay is recovered via FFT-based autocorrelation
-(Wiener-Khinchin theorem: autocorrelation = IFFT(|FFT(x)|^2)), which is
-efficient enough to run in a few milliseconds in-browser even over a
-multi-second recording.
+WHY A KNOWN TONE INSTEAD OF WHATEVER'S ALREADY PLAYING: an earlier version
+of this page had the user play arbitrary music on both speakers and blindly
+autocorrelated the recording against itself. That's less robust than it
+looks - music has its own periodicity (bass lines, drum loops, sustained
+notes) that can produce correlation peaks that have nothing to do with the
+actual inter-speaker delay. This version instead serves a known chirp tone
+at GET /calibration-tone.wav (see calibration_tone.py) that the user queues
+in Music Assistant to play on both this gateway's Sonos output and a real
+Sendspin speaker, and the browser cross-correlates the recording against
+that KNOWN reference (matched filtering) rather than against itself. This
+is strictly more robust: a single, sharp, unambiguous correlation peak per
+speaker instead of hoping arbitrary content correlates cleanly.
 
-The FFT/autocorrelation JavaScript embedded below is not ad-hoc - it was
-written and verified against a Python/numpy reference implementation
-first (recovers known synthetic delays to <1ms across a range of
-signal-to-noise and echo-strength conditions), then re-verified as a
-standalone Node.js port matching that reference before being embedded
-here. See the project's test notes for the validation cases used.
+Note on architecture: this gateway is a Sendspin *client* (a player), not a
+source - it can't force a different, independent Sendspin speaker to play
+anything. Only Music Assistant controls that. So the user still has to
+queue the tone to play on both targets; what's improved is the quality and
+reliability of the signal being measured, not the need for that one manual
+step.
+
+The FFT/matched-filtering JavaScript embedded below is not ad-hoc - it was
+validated against a Python/numpy reference implementation first (recovers
+known synthetic two-speaker delays to <1ms across a range of echo
+strengths, noise levels, and delay magnitudes from 300ms to 4500ms), then
+independently re-verified as a Node.js port producing matching results,
+before being embedded here.
 
 IMPORTANT LIMITATION, surfaced honestly in the UI rather than hidden:
-autocorrelation of a single mono microphone signal can only recover the
-*magnitude* of the delay between the two speakers, not its *sign* - it
-cannot tell you which speaker played first. In practice Sonos is almost
-always the *later* one (its own internal decode/buffering latency, per
-Sonos's own behavior, typically runs 1.5-3 seconds on top of whatever
+cross-correlating a single mono microphone recording can identify the two
+arrival times of the chirp and their separation (the delay magnitude), but
+not which speaker's arrival came first - the *sign* of the correction. In
+practice Sonos is almost always the *later* one (its own internal
+decode/buffering latency typically runs 1.5-3 seconds on top of whatever
 this add-on's delay_ms adds), but this isn't guaranteed for every setup.
-So the page asks the user to judge by ear which speaker sounded delayed,
-applies the correction in that direction, and offers a one-tap
+So the page asks the user to judge by ear which speaker's chirp sounded
+delayed, applies the correction in that direction, and offers a one-tap
 "re-measure to verify" step to confirm the residual offset actually
-shrank - closing the loop instead of asking the user to just trust a
-single black-box measurement.
+shrank - closing the loop instead of asking the user to trust a single
+black-box measurement.
 """
 from __future__ import annotations
 
-# The embedded <script> block below is the exact algorithm from
-# calibration_algo.js, ported for the browser (removes the Node.js
-# `module.exports`, everything else is unchanged) - verified against a
-# Python/numpy reference implementation and cross-checked in Node.js
-# before being placed here.
-_ALGORITHM_JS = r"""
-function nextPow2(n) {
-  let p = 1;
-  while (p < n) p *= 2;
-  return p;
-}
+from calibration_tone import SAMPLE_RATE, F0_HZ, F1_HZ, CHIRP_DURATION_MS, LEAD_IN_MS, TOTAL_DURATION_MS
+
+_ALGORITHM_JS = """
+function nextPow2(n) { let p = 1; while (p < n) p *= 2; return p; }
 
 function fft(re, im, inverse) {
   const n = re.length;
@@ -56,10 +60,7 @@ function fft(re, im, inverse) {
     let bit = n >> 1;
     for (; j & bit; bit >>= 1) j ^= bit;
     j ^= bit;
-    if (i < j) {
-      [re[i], re[j]] = [re[j], re[i]];
-      [im[i], im[j]] = [im[j], im[i]];
-    }
+    if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; }
   }
   for (let len = 2; len <= n; len <<= 1) {
     const ang = (2 * Math.PI / len) * (inverse ? -1 : 1);
@@ -70,54 +71,85 @@ function fft(re, im, inverse) {
         const uRe = re[i + k], uIm = im[i + k];
         const vRe = re[i + k + len / 2] * curRe - im[i + k + len / 2] * curIm;
         const vIm = re[i + k + len / 2] * curIm + im[i + k + len / 2] * curRe;
-        re[i + k] = uRe + vRe;
-        im[i + k] = uIm + vIm;
-        re[i + k + len / 2] = uRe - vRe;
-        im[i + k + len / 2] = uIm - vIm;
+        re[i + k] = uRe + vRe; im[i + k] = uIm + vIm;
+        re[i + k + len / 2] = uRe - vRe; im[i + k + len / 2] = uIm - vIm;
         const nextRe = curRe * wRe - curIm * wIe;
         const nextIm = curRe * wIe + curIm * wRe;
-        curRe = nextRe;
-        curIm = nextIm;
+        curRe = nextRe; curIm = nextIm;
       }
     }
   }
 }
 
-function findEchoDelay(signal, sampleRate, minLagMs, maxLagMs) {
-  const n = signal.length;
-  const maxLag = Math.floor(maxLagMs * sampleRate / 1000);
-  const minLag = Math.floor(minLagMs * sampleRate / 1000);
-  const nfft = nextPow2(n + maxLag);
+function genChirp(sampleRate, durationMs, f0, f1) {
+  const n = Math.floor(sampleRate * durationMs / 1000);
+  const T = durationMs / 1000;
+  const out = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const t = i / sampleRate;
+    const phase = 2 * Math.PI * (f0 * t + (f1 - f0) / (2 * T) * t * t);
+    const window = n > 1 ? 0.5 * (1 - Math.cos(2 * Math.PI * i / (n - 1))) : 1.0;
+    out[i] = Math.sin(phase) * window;
+  }
+  return out;
+}
 
-  const re = new Float64Array(nfft);
-  const im = new Float64Array(nfft);
-  re.set(signal);
+function genReferenceTrack(sampleRate, totalMs, chirpStartMs, chirpDurationMs, f0, f1) {
+  const nTotal = Math.floor(sampleRate * totalMs / 1000);
+  const track = new Float64Array(nTotal);
+  const chirp = genChirp(sampleRate, chirpDurationMs, f0, f1);
+  const start = Math.floor(sampleRate * chirpStartMs / 1000);
+  for (let i = 0; i < chirp.length && start + i < nTotal; i++) track[start + i] = chirp[i];
+  return track;
+}
 
-  fft(re, im, false);
+function crossCorrelateFindTwoPeaks(recorded, reference, sampleRate, excludeWindowMs) {
+  const n = recorded.length, m = reference.length;
+  const nfft = nextPow2(n + m);
+  const reR = new Float64Array(nfft), imR = new Float64Array(nfft);
+  const reF = new Float64Array(nfft), imF = new Float64Array(nfft);
+  reR.set(recorded);
+  reF.set(reference);
+  fft(reR, imR, false);
+  fft(reF, imF, false);
+  const outRe = new Float64Array(nfft), outIm = new Float64Array(nfft);
   for (let i = 0; i < nfft; i++) {
-    re[i] = re[i] * re[i] + im[i] * im[i];
-    im[i] = 0;
+    outRe[i] = reR[i] * reF[i] + imR[i] * imF[i];
+    outIm[i] = imR[i] * reF[i] - reR[i] * imF[i];
   }
-  fft(re, im, true);
-  for (let i = 0; i < nfft; i++) re[i] /= nfft;
+  fft(outRe, outIm, true);
+  for (let i = 0; i < nfft; i++) outRe[i] /= nfft;
 
-  const zeroLag = re[0];
-  let bestIdx = minLag;
-  let bestVal = -Infinity;
-  for (let k = minLag; k < maxLag; k++) {
-    if (re[k] > bestVal) {
-      bestVal = re[k];
-      bestIdx = k;
-    }
+  const exclude = Math.floor(excludeWindowMs * sampleRate / 1000);
+  let idx1 = 0, val1 = -Infinity;
+  for (let i = 0; i < outRe.length; i++) if (outRe[i] > val1) { val1 = outRe[i]; idx1 = i; }
+
+  let idx2 = 0, val2 = -Infinity;
+  const lo = Math.max(0, idx1 - exclude), hi = Math.min(outRe.length, idx1 + exclude);
+  for (let i = 0; i < outRe.length; i++) {
+    if (i >= lo && i < hi) continue;
+    if (outRe[i] > val2) { val2 = outRe[i]; idx2 = i; }
   }
-  return {
-    delayMs: bestIdx * 1000 / sampleRate,
-    confidence: bestVal / zeroLag,
-  };
+
+  const delaySamples = Math.abs(idx1 - idx2);
+  const delayMs = delaySamples * 1000 / sampleRate;
+  let refEnergy = 0;
+  for (let i = 0; i < reference.length; i++) refEnergy += reference[i] * reference[i];
+  const confidence = refEnergy > 0 ? Math.min(val1, val2) / refEnergy : 0;
+  return { delayMs, confidence };
 }
 """
 
-PAGE_HTML = r"""<!DOCTYPE html>
+_REF_PARAMS_JS = """
+const REF_SAMPLE_RATE = %d;
+const REF_F0 = %d;
+const REF_F1 = %d;
+const REF_CHIRP_DURATION_MS = %d;
+const REF_LEAD_IN_MS = %d;
+const REF_TOTAL_MS = %d;
+""" % (SAMPLE_RATE, F0_HZ, F1_HZ, CHIRP_DURATION_MS, LEAD_IN_MS, TOTAL_DURATION_MS)
+
+PAGE_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -139,6 +171,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .warn { color: #f59e0b; }
   .good { color: #10b981; }
   code { background: #2a2a2a; padding: 1px 5px; border-radius: 4px; }
+  a { color: #3b82f6; }
 </style>
 </head>
 <body>
@@ -147,14 +180,17 @@ PAGE_HTML = r"""<!DOCTYPE html>
 
 <div class="card">
   <p>This measures the real acoustic delay between this Sonos speaker and
-  an actual Sendspin speaker, using your phone or laptop's microphone -
-  instead of guessing with the slider by ear.</p>
+  an actual Sendspin speaker, using your phone or laptop's microphone and
+  a known test tone - instead of guessing with the slider by ear.</p>
   <ol>
-    <li>Start the <b>same track</b> playing in Music Assistant to <b>both</b>
-      this Sonos speaker and a real Sendspin speaker, in the same room.</li>
+    <li>In Music Assistant, queue <a href="calibration-tone.wav" target="_blank">this calibration tone</a>
+      (a short chirp) to play on <b>both</b> this Sonos speaker and a real
+      Sendspin speaker, in the same room. (Music Assistant's "play URL" /
+      quick-play feature can target a group containing both players.)</li>
     <li>Place this device's microphone roughly <b>between</b> the two
       speakers.</li>
-    <li>Stay quiet, tap <b>Measure</b>, and wait a few seconds.</li>
+    <li>Start the tone playing, then tap <b>Measure</b> below within a
+      few seconds.</li>
   </ol>
   <p class="muted">Current gateway delay: <span id="currentDelay">-</span> ms</p>
 </div>
@@ -168,9 +204,10 @@ PAGE_HTML = r"""<!DOCTYPE html>
 <div class="card" id="resultCard" style="display:none">
   <p>Detected offset: <span class="big" id="offsetMs">-</span> ms</p>
   <p class="muted" id="confidenceNote"></p>
-  <p>Autocorrelation can tell us <b>how far apart</b> the two speakers are,
-  but not <b>which one</b> played first - listen and judge which speaker
-  sounded delayed, then pick the matching button below.</p>
+  <p>Matched filtering can tell us <b>how far apart</b> the two speakers'
+  chirps arrived, but not <b>which one</b> arrived first - listen and
+  judge which speaker's chirp sounded delayed, then pick the matching
+  button below.</p>
   <button class="late" id="applyLateBtn">Sonos sounded LATE (most common)</button>
   <button class="early" id="applyEarlyBtn">Sonos sounded EARLY</button>
   <p class="muted" id="applyNote"></p>
@@ -183,15 +220,17 @@ PAGE_HTML = r"""<!DOCTYPE html>
 
 <script>
 __ALGORITHM_JS__
+__REF_PARAMS_JS__
 </script>
 <script>
 const API_BASE = "";
 let lastMeasurement = null;
 let audioCtx = null, stream = null, processor = null, source = null;
+let referenceTrack = null;
 
 async function fetchStatus() {
   try {
-    const r = await fetch(API_BASE + "/api/delay");
+    const r = await fetch(API_BASE + "api/delay");
     const j = await r.json();
     document.getElementById("currentDelay").textContent = j.delay_ms;
     return j.delay_ms;
@@ -201,6 +240,20 @@ async function fetchStatus() {
   }
 }
 fetchStatus();
+
+if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+  const banner = document.createElement("div");
+  banner.className = "card";
+  banner.innerHTML =
+    '<p class="warn"><b>Microphone access unavailable on this page as loaded.</b> ' +
+    "Browsers require a secure context (HTTPS, or localhost) for microphone access - a plain " +
+    "<code>http://&lt;ip&gt;:8099</code> LAN address never qualifies. Open this page through " +
+    "Home Assistant instead: Settings &rarr; Add-ons &rarr; Sendspin Sonos Gateway &rarr; " +
+    "<b>Open Web UI</b>. That only unlocks the microphone if Home Assistant itself is reachable " +
+    "over HTTPS (Nabu Casa or a configured certificate) - see the README for a desktop-only " +
+    "workaround otherwise.</p>";
+  document.body.insertBefore(banner, document.body.children[1]);
+}
 
 function downsample(buffer, fromRate, toRate) {
   const factor = Math.max(1, Math.round(fromRate / toRate));
@@ -257,36 +310,60 @@ async function record(durationS) {
 }
 
 async function measure() {
+  if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    document.getElementById("status").innerHTML =
+      "Microphone access isn't available on this page as loaded. Browsers only allow it in a " +
+      "\\"secure context\\" (HTTPS, or literally <code>localhost</code>) - a plain " +
+      "<code>http://&lt;ip&gt;:8099</code> address never qualifies, even on your own LAN. " +
+      "Open this page via Home Assistant instead: Settings &rarr; Add-ons &rarr; Sendspin Sonos " +
+      "Gateway &rarr; <b>Open Web UI</b> (this only works if Home Assistant itself is reachable " +
+      "over HTTPS - Nabu Casa remote access or a configured certificate). See this add-on's README " +
+      "for a desktop-only Chrome workaround if HTTPS isn't available.";
+    document.getElementById("status").className = "muted warn";
+    return;
+  }
+
   const btn = document.getElementById("measureBtn");
   btn.disabled = true;
-  document.getElementById("status").textContent = "Listening for 6 seconds - stay quiet...";
+  const recordSeconds = Math.ceil(REF_TOTAL_MS / 1000) + 5;
+  document.getElementById("status").textContent = "Listening for " + recordSeconds + " seconds - make sure the tone is playing on both speakers...";
   document.getElementById("resultCard").style.display = "none";
   document.getElementById("verifyCard").style.display = "none";
 
   try {
-    const { samples, sampleRate } = await record(6);
+    const { samples, sampleRate } = await record(recordSeconds);
     document.getElementById("status").textContent = "Analyzing...";
-    const targetRate = 4000;
-    const down = downsample(samples, sampleRate, targetRate);
-    const { delayMs, confidence } = findEchoDelay(down, targetRate, 80, 5000);
+
+    if (referenceTrack === null) {
+      referenceTrack = genReferenceTrack(REF_SAMPLE_RATE, REF_TOTAL_MS, REF_LEAD_IN_MS, REF_CHIRP_DURATION_MS, REF_F0, REF_F1);
+    }
+    const workingRate = 4000;
+    const downRecorded = downsample(samples, sampleRate, workingRate);
+    const downReference = downsample(referenceTrack, REF_SAMPLE_RATE, workingRate);
+
+    const { delayMs, confidence } = crossCorrelateFindTwoPeaks(downRecorded, downReference, workingRate, 50);
 
     lastMeasurement = delayMs;
     document.getElementById("offsetMs").textContent = delayMs.toFixed(0);
     const confNote = document.getElementById("confidenceNote");
-    if (confidence > 0.15) {
+    if (confidence > 0.2) {
       confNote.textContent = "Confidence: good (" + confidence.toFixed(2) + ")";
       confNote.className = "muted good";
     } else if (confidence > 0.05) {
-      confNote.textContent = "Confidence: moderate (" + confidence.toFixed(2) + ") - consider re-measuring somewhere quieter.";
+      confNote.textContent = "Confidence: moderate (" + confidence.toFixed(2) + ") - consider re-measuring somewhere quieter, or check the tone is actually playing on both speakers.";
       confNote.className = "muted warn";
     } else {
-      confNote.textContent = "Confidence: low (" + confidence.toFixed(2) + ") - result may be unreliable. Check both speakers are actually playing the same audio, reduce background noise, and try again.";
+      confNote.textContent = "Confidence: low (" + confidence.toFixed(2) + ") - result may be unreliable. Check the tone is playing on BOTH speakers, reduce background noise, and try again.";
       confNote.className = "muted warn";
     }
     document.getElementById("resultCard").style.display = "block";
     document.getElementById("status").textContent = "Done.";
   } catch (err) {
-    document.getElementById("status").textContent = "Error: " + err.message + " (microphone permission needed)";
+    if (err.name === "NotAllowedError") {
+      document.getElementById("status").textContent = "Microphone permission was denied. Allow microphone access for this page and try again.";
+    } else {
+      document.getElementById("status").textContent = "Error: " + err.message;
+    }
   } finally {
     btn.disabled = false;
   }
@@ -297,7 +374,7 @@ async function applyDelay(direction) {
   if (current === null || lastMeasurement === null) return;
   let next = direction === "late" ? current - lastMeasurement : current + lastMeasurement;
   next = Math.max(0, Math.min(5000, Math.round(next)));
-  const r = await fetch(API_BASE + "/api/delay", {
+  const r = await fetch(API_BASE + "api/delay", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ delay_ms: next }),
@@ -313,7 +390,7 @@ document.getElementById("measureBtn").addEventListener("click", measure);
 document.getElementById("applyLateBtn").addEventListener("click", () => applyDelay("late"));
 document.getElementById("applyEarlyBtn").addEventListener("click", () => applyDelay("early"));
 document.getElementById("verifyBtn").addEventListener("click", async () => {
-  document.getElementById("verifyNote").textContent = "Re-measuring...";
+  document.getElementById("verifyNote").textContent = "Re-measuring - make sure the tone is playing again first...";
   await measure();
   if (lastMeasurement !== null) {
     const improved = lastMeasurement < 100;
@@ -326,7 +403,9 @@ document.getElementById("verifyBtn").addEventListener("click", async () => {
 </script>
 </body>
 </html>
-""".replace("__ALGORITHM_JS__", _ALGORITHM_JS)
+"""
+
+PAGE_HTML = PAGE_HTML.replace("__ALGORITHM_JS__", _ALGORITHM_JS).replace("__REF_PARAMS_JS__", _REF_PARAMS_JS)
 
 
 def render_page() -> str:

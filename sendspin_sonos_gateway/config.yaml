@@ -22,16 +22,35 @@ host_network: true
 homeassistant_api: true
 hassio_api: true
 
+# Ingress lets the /calibrate page be opened through Home Assistant's own
+# frontend (Settings -> Add-ons -> this add-on -> Open Web UI) instead of
+# a raw http://<lan-ip>:8099 URL. This matters for more than convenience:
+# browsers only expose microphone access (getUserMedia) in a "secure
+# context" - HTTPS, or literally localhost - and a bare LAN-IP http:// URL
+# is never treated as one. An ingress-embedded page inherits the security
+# context of the Home Assistant frontend itself, so if HA is reachable
+# over HTTPS (Nabu Casa, a reverse proxy, or a configured cert), the
+# calibration page's microphone access starts working through ingress
+# even though it never would over the raw port. See the README for the
+# real limitation this doesn't solve (HA itself still needs to be HTTPS).
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:tune-vertical
+panel_title: Sendspin Calibration
+
 # Entities (number.sendspin_delay, sensors, button, switch) are published
 # via MQTT discovery, which is the standard way for a *supervisor add-on*
 # (as opposed to a custom integration) to create fully-fledged HA entities.
 services:
   - "mqtt:want"
 
+# Still needed independently of ingress: Sonos's own play_uri call must
+# reach this port directly over the LAN, and never goes through Home
+# Assistant's ingress proxy.
 ports:
   8099/tcp: 8099
 ports_description:
-  8099/tcp: "Audio stream endpoint consumed by Sonos (play_uri)"
+  8099/tcp: "Audio stream endpoint consumed by Sonos (play_uri); also serves /calibrate directly"
 
 options:
   sonos_ip: ""

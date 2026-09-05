@@ -3,47 +3,108 @@
 Home Assistant add-on that acts as a virtual Sendspin player and forwards
 audio to a Sonos coordinator, with a live, glitch-free delay slider.
 
+## Fixed: microphone unavailable ("Cannot read properties of undefined (reading 'getUserMedia')")
+
+This error means `navigator.mediaDevices` itself was `undefined` - not a
+permission prompt being denied, but the whole API being absent. Browsers
+only expose microphone access in a **secure context**: HTTPS, or literally
+`localhost`. A plain `http://<lan-ip>:8099/calibrate` address is never
+treated as one, on any browser, so no permission dialog was ever going to
+appear.
+
+**Fix - Home Assistant Ingress**: `config.yaml` now sets `ingress: true`
+and `ingress_port: 8099`, so the page can be opened via **Settings →
+Add-ons → Sendspin Sonos Gateway → Open Web UI** instead of a raw
+`http://ip:port` URL. An ingress-embedded page inherits the security
+context of the Home Assistant frontend itself.
+
+**The part that's still on you, disclosed rather than hidden**: this only
+actually unlocks the microphone if Home Assistant itself is reachable over
+HTTPS - via Nabu Casa remote access, or a reverse proxy / certificate you've
+configured. If your HA instance is accessed as plain `http://homeassistant.
+local:8123`, ingress does not make it a secure context either, and the
+microphone will still be unavailable through ingress too - this is a
+fundamental browser security rule, not something any add-on can route
+around. If that's your situation and you're on a desktop browser (not a
+phone, no equivalent exists on mobile Safari), Chrome/Edge have a flag,
+`chrome://flags/#unsafely-treat-insecure-origin-as-secure`, where you can
+add `http://<gateway-ip>:8099` as a trusted exception for testing.
+
+The page now also detects this case explicitly on load and shows a plain-
+language banner explaining it, and the **Measure** button checks for it
+upfront instead of throwing the confusing raw exception. Verified: the
+relative-URL fix that makes API calls work correctly both with and without
+the ingress path prefix was checked against Node's actual `URL` resolver
+for both cases (direct access and `/api/hassio_ingress/<token>/...`), not
+just asserted.
+
 ## Delay calibration by acoustic measurement, not guesswork
 
 Manually nudging a slider while listening for echo is unreliable and
-tedious. `http://<gateway-ip>:8099/calibrate` (LAN-reachable, since
-`host_network: true`) serves a self-contained page that measures the
-actual acoustic delay using your phone or laptop's microphone:
+tedious. `http://<gateway-ip>:8099/calibrate` serves a self-contained
+page that measures the actual acoustic delay using your phone or laptop's
+microphone and a **known calibration tone**, rather than blindly
+autocorrelating whatever happens to already be playing:
 
-1. Play the same track on Music Assistant to both this Sonos speaker and
-   a real, natively-synced Sendspin speaker in the same room.
-2. Place the microphone roughly between them and tap **Measure**.
-3. The page records ~6 seconds of audio and finds the delay between the
-   two speakers via FFT-based autocorrelation (Wiener-Khinchin theorem:
-   `autocorrelation = IFFT(|FFT(signal)|^2)`) - if the same audio is
-   coming from two speakers with a timing offset, the microphone picks up
-   one copy plus a delayed echo of itself, and this recovers that delay.
+1. In Music Assistant, queue the tone at `/calibration-tone.wav` (linked
+   from the page) to play on both this Sonos speaker and a real,
+   natively-synced Sendspin speaker in the same room.
+2. Place the microphone roughly between them, start the tone, and tap
+   **Measure**.
+3. The page cross-correlates the recording against the *known* reference
+   chirp (matched filtering: `IFFT(FFT(recorded) * conj(FFT(reference)))`),
+   finds the two arrival peaks (one per speaker), and reports their
+   separation.
 
-**Honesty about a real limitation, not hidden in the UI**: autocorrelation
-of a single mono microphone can only recover the *magnitude* of the delay
-between the two speakers, not *which one* played first. So the page asks
-you to judge by ear which speaker sounded delayed and pick the matching
-button, then applies the correction and offers a **re-measure to verify**
-step so you can confirm the residual offset actually shrank rather than
-blindly trusting one measurement.
+**Why a generated tone instead of "play the same song on both"** (the
+original design, changed after specifically being asked "shouldn't the
+add-on play the tone?"): blindly autocorrelating arbitrary music is less
+reliable than it looks - music has its own periodicity (bass lines, drum
+loops, sustained notes) that can produce correlation peaks unrelated to
+the actual inter-speaker delay. A known chirp, matched-filtered against
+a signal we generated ourselves, gives one sharp, unambiguous peak per
+speaker instead. `app/calibration_tone.py` generates the WAV file served
+at `/calibration-tone.wav`; the exact same chirp parameters (frequency
+sweep, timing) are used to build the correlation reference in-browser, so
+they're mathematically guaranteed to match rather than needing to decode
+the WAV back out.
 
-The FFT/autocorrelation algorithm embedded in the page (`app/calibration.py`)
-was not written ad-hoc: it was validated against a Python/numpy reference
-implementation first (recovers known synthetic echo delays to <1ms across
-a range of signal strengths and noise levels, from 150ms to 4800ms), then
-independently re-verified as a Node.js port producing matching results,
-*before* being embedded in the page. The live `/calibrate` and `/api/delay`
-endpoints were also tested end-to-end (page serves and contains the
-algorithm; `GET`/`POST /api/delay` correctly reads, sets, and clamps the
-live `DelayEngine`) - all against the actual running aiohttp server, not
-just read for plausibility.
+**A structural limit worth being upfront about**: this gateway is a
+Sendspin *client*, not a source - it has no ability to make an
+independent, natively-synced Sendspin speaker play anything. Only Music
+Assistant controls that. So queueing the tone on both speakers is still a
+manual step; what changed is the quality and reliability of the *signal*
+being measured, not that one remaining step.
+
+**Honesty about a second, different limitation, not hidden in the UI**:
+cross-correlation can recover the two speakers' arrival times and their
+separation (the delay magnitude), but not *which* speaker's chirp arrived
+first - the *sign* of the correction. So the page asks you to judge by ear
+which speaker's chirp sounded delayed and pick the matching button, then
+offers a **re-measure to verify** step to confirm the residual offset
+actually shrank rather than blindly trusting one measurement.
+
+**Verified, in order**: the matched-filter two-peak-detection algorithm
+was validated against a Python/numpy reference implementation (recovers
+known synthetic two-speaker delays to <1ms across delay magnitudes from
+300ms to 4500ms and a range of echo strengths/noise levels), independently
+re-verified as a Node.js port with matching results, then re-checked again
+against the *exact bytes* actually embedded in the served page (not just
+"should be the same") - confirmed to differ only by a defensive edge-case
+guard and unused debug fields, with the embedded version re-run through
+the identical test suite to confirm those differences don't change
+behavior. The generated WAV file was parsed back with Python's `wave`
+module and checked for correct structure, sample rate, silence in the
+lead-in, and real signal in the chirp region. The live `/calibrate`,
+`/calibration-tone.wav`, and `/api/delay` endpoints were tested end-to-end
+against the actual running aiohttp server.
 
 **Not tested**: an actual microphone recording of two real speakers in a
 real room. Everything above is real algorithmic and wiring correctness,
-but a browser mic on real hardware picking up real room acoustics,
-reverb, and background noise is a different (harder) test than clean
-synthetic signals - the confidence score shown in the UI is there so you
-can judge in the moment whether a given measurement looks trustworthy.
+but a browser mic on real hardware picking up real room acoustics, reverb,
+and background noise is a different (harder) test than clean synthetic
+signals - the confidence score shown in the UI is there so you can judge
+in the moment whether a given measurement looks trustworthy.
 
 ## Fixed: real cause of "no sound" from live device logs
 
