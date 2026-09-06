@@ -106,6 +106,37 @@ and background noise is a different (harder) test than clean synthetic
 signals - the confidence score shown in the UI is there so you can judge
 in the moment whether a given measurement looks trustworthy.
 
+## Fixed: pause doesn't resume; song changes cause drift/desync
+
+**Won't resume after pause**: `_sonos_bootstrap()` calls `play_uri` exactly
+once, at startup. If a long pause exceeds Sonos's own silence tolerance
+(the same failure mode originally fixed for the initial 35-second startup
+race - see below), Sonos gives up and disconnects from our stream, and
+nothing was watching for that afterward. Added a watchdog task
+(`_resume_watchdog_loop` in `main.py`) that notices when Sonos has no
+active connection to our stream while the Sendspin connection is still
+alive, and re-issues `play_uri` automatically. Verified: exercised the
+exact conditional logic against a mocked `Gateway`, confirming it
+re-triggers when the listener count is zero and stays quiet when Sonos
+already has an active connection.
+
+**Song changes cause drift**: `sendspin_client.py` was discarding the
+Sendspin server's presentation timestamps entirely, just appending
+whatever PCM arrived straight into the ring buffer. Track transitions
+(and any other brief re-buffering) contain small real gaps in the
+incoming audio; without accounting for them, the ring buffer's elapsed
+time quietly falls behind real elapsed time by the gap's length, and
+Sonos's "behind by delay_ms" lag grows by that same amount, pushing it
+further from the reference speaker's continuous, self-correcting Sendspin
+clock. Now `_on_audio_chunk` uses the presentation timestamps to detect
+gaps above 20ms and pads the ring buffer with the missing silence (capped
+at 10s so a genuine long pause doesn't pointlessly buffer minutes of
+silence), keeping elapsed time - and therefore Sonos's delay - constant
+across track changes. Verified with direct unit tests: a simulated 500ms
+gap between chunks resulted in exactly 500ms of padded silence plus the
+real audio (600ms total gained, matching expectation to within 5ms),
+while normal ~5ms inter-chunk jitter correctly triggered no padding.
+
 ## Fixed: real cause of "no sound" from live device logs
 
 A later round of real logs from an actual Sonos speaker + Music Assistant

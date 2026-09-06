@@ -19,13 +19,21 @@ from aiosendspin.models.core import DeviceInfo, StreamStartMessage
 from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
 from aiosendspin.models.types import AudioCodec, Roles
 
-from ring_buffer import RingBuffer, SAMPLE_RATE, CHANNELS
+from ring_buffer import RingBuffer, SAMPLE_RATE, CHANNELS, FRAME_SIZE
 
 log = logging.getLogger("ssg.sendspin_client")
 
 RECONNECT_DELAY_S = 3
 DATA_DIR = Path("/data") if Path("/data").is_dir() else Path("/tmp/sendspin-sonos-gateway-data")
 CLIENT_ID_FILE = DATA_DIR / "sendspin_client_id.txt"
+
+# Gaps shorter than this are just normal jitter between chunks, not a real
+# track-change/re-buffer pause - don't pad tiny amounts constantly.
+GAP_PAD_THRESHOLD_US = 20_000  # 20ms
+# Cap how much silence we'll insert for one gap - a genuinely long pause
+# (the user stopped playback) doesn't need "preserving," and padding
+# minutes of silence into the ring buffer would be pointless and wasteful.
+GAP_PAD_MAX_US = 10_000_000  # 10s
 
 # We only ever advertise raw PCM support. This means the server will never
 # send us compressed audio, so every audio chunk handed to the callback is
@@ -64,6 +72,13 @@ class SendspinClient:
         self._audio_started = asyncio.Event()
         self._stop = asyncio.Event()
         self._stream_info: dict = {}
+        # Used to detect gaps in the incoming audio (e.g. track changes,
+        # brief re-buffering) via presentation timestamps, so we can pad
+        # with silence and keep the ring buffer's elapsed time matching
+        # real elapsed time - otherwise every gap silently shortens what
+        # we forward to Sonos, and its "behind by delay_ms" lag creeps
+        # further out of sync after every song change.
+        self._next_expected_us: int | None = None
 
     @property
     def connected(self) -> bool:
@@ -170,13 +185,33 @@ class SendspinClient:
 
     def _on_audio_chunk(self, timestamp_us: int, audio_data: bytes, fmt: AioAudioFormat) -> None:
         """Feed raw PCM straight into the ring buffer. `timestamp_us` is the
-        server's presentation timestamp in microseconds; since Sonos (not
-        us) does the actual playback timing, we don't need it for anything
-        beyond optional drift logging - see LatencyTracker."""
+        server's presentation timestamp in microseconds. We use it to
+        detect gaps (track changes, brief re-buffering) and pad with
+        silence, since Sonos (not us) does the actual playback timing and
+        would otherwise fall further behind by however long each gap
+        lasted, with no self-correction - unlike genuine Sendspin players,
+        which realign to the server's absolute clock continuously."""
         if fmt.codec is not AudioCodec.PCM:
             log.warning("Received unexpected codec %s from Sendspin server; dropping chunk", fmt.codec)
             return
+
+        if self._next_expected_us is not None:
+            gap_us = timestamp_us - self._next_expected_us
+            if gap_us > GAP_PAD_THRESHOLD_US:
+                capped_gap_us = min(gap_us, GAP_PAD_MAX_US)
+                gap_bytes = int(capped_gap_us * SAMPLE_RATE / 1_000_000) * FRAME_SIZE
+                if gap_bytes > 0:
+                    self.ring_buffer.write(b"\x00" * gap_bytes)
+                log.info(
+                    "Detected %.0fms gap in Sendspin audio (track change/re-buffer); "
+                    "padded %.0fms of silence to keep Sonos's timing from drifting",
+                    gap_us / 1000, capped_gap_us / 1000,
+                )
+
         self.ring_buffer.write(audio_data)
+        frame_count = len(audio_data) // FRAME_SIZE
+        self._next_expected_us = timestamp_us + int(frame_count * 1_000_000 / SAMPLE_RATE)
+
         if not self._audio_started.is_set():
             self._audio_started.set()
 
@@ -209,6 +244,7 @@ class SendspinClient:
         log.info("Disconnected from Sendspin server")
         self._connected.clear()
         self._audio_started.clear()
+        self._next_expected_us = None
 
     @property
     def stream_info(self) -> dict:

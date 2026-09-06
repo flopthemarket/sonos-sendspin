@@ -138,6 +138,7 @@ class Gateway:
                 name="sonos_monitor",
             ),
             asyncio.create_task(self._metrics_loop(), name="metrics_loop"),
+            asyncio.create_task(self._resume_watchdog_loop(), name="resume_watchdog"),
         ]
 
         try:
@@ -180,6 +181,33 @@ class Gateway:
             await asyncio.sleep(METRICS_PUBLISH_INTERVAL_S)
             snapshot = self.latency_tracker.snapshot()
             self.ha.publish_latency_snapshot(snapshot)
+
+    async def _resume_watchdog_loop(self) -> None:
+        """_sonos_bootstrap() only calls play_uri once, at startup. If
+        Sonos's own HTTP connection to our stream later drops - e.g. it
+        gave up after a long pause exceeded its own silence tolerance, the
+        same failure mode originally fixed for the initial connection -
+        nothing else re-issues play_uri, so playback never resumes even
+        once real audio is flowing again. This watches for exactly that
+        (no active listener on our stream, but the Sendspin connection
+        itself is still alive) and reconnects Sonos automatically."""
+        poll_interval_s = 10
+        min_retry_gap_s = 20
+        loop = asyncio.get_event_loop()
+        last_attempt = 0.0
+        while True:
+            await asyncio.sleep(poll_interval_s)
+            if not self.bridge_enabled or not self.sendspin_client.connected:
+                continue
+            if self.stream_server.active_listeners > 0:
+                continue
+            now = loop.time()
+            if now - last_attempt < min_retry_gap_s:
+                continue
+            last_attempt = now
+            log.info("No active Sonos connection to our stream; re-issuing play_uri so playback can resume")
+            ok = await loop.run_in_executor(None, self.sonos.play_stream, self._gateway_host)
+            self.ha.publish_stream_state("streaming" if ok else f"error: {self.sonos.last_error}")
 
 
 def main() -> None:
