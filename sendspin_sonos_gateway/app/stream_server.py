@@ -144,6 +144,11 @@ class StreamServer:
                 "Connection": "keep-alive",
             },
         )
+        # Explicit, not just implied by omitting Content-Length: never send
+        # a Content-Length for this live feed, and use chunked encoding, so
+        # Sonos treats this as a live stream rather than a fixed-length
+        # file it might try to pre-buffer/seek within.
+        response.enable_chunked_encoding()
         await response.prepare(request)
 
         self.active_listeners += 1
