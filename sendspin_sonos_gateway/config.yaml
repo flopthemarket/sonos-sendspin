@@ -1,5 +1,5 @@
 name: Sendspin Sonos Gateway
-version: "0.3.0"
+version: "0.4.0"
 slug: sendspin_sonos_gateway
 description: Bridges a Sendspin audio stream to Sonos speakers with a live, glitch-free delay control.
 url: "https://github.com/flopthemarket/sonos-sendspin"

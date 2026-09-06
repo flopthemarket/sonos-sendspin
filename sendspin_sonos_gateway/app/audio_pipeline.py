@@ -18,6 +18,7 @@ import asyncio
 import logging
 import subprocess
 import threading
+import time
 
 from ring_buffer import RingBuffer, SAMPLE_RATE, CHANNELS, FRAME_SIZE
 
@@ -54,6 +55,11 @@ class AudioEncoder:
         self._feeder_thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._reader_id: int | None = None
+        # Total frames actually written into ffmpeg's stdin so far - useful
+        # for diagnostics/tests to verify real-time pacing independently of
+        # ffmpeg's own internal encoder output buffering (a separate,
+        # unrelated concern from how fast we feed it).
+        self.frames_fed = 0
 
     def start(self) -> None:
         self._reader_id = self.ring_buffer.open_reader()
@@ -82,6 +88,19 @@ class AudioEncoder:
     def _feed_loop(self) -> None:
         assert self._proc is not None and self._proc.stdin is not None
         assert self._reader_id is not None
+        # Real-time pacing: without this, ffmpeg (and therefore Sonos)
+        # receives audio as fast as the ring buffer/network allow, which
+        # means Sonos gets however much backlog happened to already be
+        # buffered at connect time delivered as one instant burst - and
+        # how big that burst is varies run to run (time since last write,
+        # network speed, etc). That makes Sonos's own internal buffering
+        # start from a different state every time it (re)connects, which
+        # is exactly the kind of thing that would make the timing land
+        # early sometimes and late other times after every pause/resume.
+        # Pacing output to exactly real-time gives Sonos the same,
+        # consistent delivery pattern on every single connection.
+        frames_fed = 0
+        start_time = time.monotonic()
         try:
             while not self._stop.is_set():
                 chunk = self.ring_buffer.read(self._reader_id, READ_CHUNK_BYTES, timeout=1.0)
@@ -89,6 +108,15 @@ class AudioEncoder:
                     break
                 if not chunk:
                     continue
+
+                frames_fed += len(chunk) // FRAME_SIZE
+                self.frames_fed = frames_fed
+                expected_elapsed = frames_fed / SAMPLE_RATE
+                actual_elapsed = time.monotonic() - start_time
+                sleep_time = expected_elapsed - actual_elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
                 self._proc.stdin.write(chunk)
         except (BrokenPipeError, OSError):
             pass

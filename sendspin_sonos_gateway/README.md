@@ -106,6 +106,39 @@ and background noise is a different (harder) test than clean synthetic
 signals - the confidence score shown in the UI is there so you can judge
 in the moment whether a given measurement looks trustworthy.
 
+## Fixed: calibration doesn't land close enough; timing flips direction after pause
+
+**Root cause**: the HTTP stream to Sonos was never throttled to real-time.
+`ffmpeg` (and therefore Sonos) received audio as fast as the ring buffer
+and network allowed - meaning whenever Sonos (re)connected, it received
+however much backlog happened to already be buffered as one instant
+burst, and how large that burst was varied run to run (time since the
+last write, network speed, prior pauses, etc). Sonos's own internal
+buffering algorithm starts from a different state depending on how much
+data it's handed up front, so its real playback latency wasn't a fixed
+number - it depended on the *size of that burst*, which is exactly why
+the timing could land early after one pause and late after another: the
+add-on's own behavior was the source of the inconsistency, not just
+Sonos's opaque internals.
+
+**Fix**: `audio_pipeline.py`'s feed loop now paces PCM into `ffmpeg` at
+exactly real-time speed (1 second of audio per 1 second of wall-clock
+time), regardless of how much backlog exists in the ring buffer. Every
+connection - fresh start, resume after pause, reconnect after a hiccup -
+now sees the same, consistent delivery pattern, giving Sonos's own
+buffering a fair chance at behaving consistently instead of depending on
+burst size. This won't make the calibrated `delay_ms` perfectly exact
+(Sonos's baseline internal latency is still an opaque black box we can't
+query), but it removes a real, self-inflicted source of run-to-run
+variance that no amount of delay-tuning could have fixed on its own.
+
+**Verified**: instrumented the feed loop's own frame-count tracking
+directly (decoupled from `ffmpeg`'s separate, unrelated internal output
+buffering, which nearly derailed the first test attempt) and confirmed
+frames fed into `ffmpeg` track wall-clock time to within ~1-2% and
+correctly cap once a pre-loaded backlog is drained, rather than dumping
+it all at once.
+
 ## Fixed: pause doesn't resume; song changes cause drift/desync
 
 **Won't resume after pause**: `_sonos_bootstrap()` calls `play_uri` exactly
